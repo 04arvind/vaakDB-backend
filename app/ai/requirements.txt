@@ -1,0 +1,21 @@
+# Extra dependencies of the app/ai module, on top of the root requirements.txt
+# (fastapi, pydantic-settings, sqlalchemy, psycopg, httpx, sqlglot, python-jose,
+# python-multipart are already listed there).
+#
+#   pip install -r requirements.txt -r app/ai/requirements.txt
+
+# SQLAlchemy's async engine needs greenlet (missing from the root requirements)
+sqlalchemy[asyncio]>=2.0
+
+# Orchestration + chunking
+langgraph>=0.6,<2
+langchain-text-splitters>=0.3,<2
+
+# Vector database (embedded "persistent" mode or a Chroma server via CHROMA_MODE=http)
+chromadb>=1.0,<2
+
+# Recommended async Postgres driver (psycopg 3 async is used when this is missing)
+asyncpg>=0.29
+
+# Tests
+pytest>=8
