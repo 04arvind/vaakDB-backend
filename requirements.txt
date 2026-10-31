@@ -18,3 +18,4 @@ structlog
 langchain
 langgraph
 chromadb
+pwdlib[argon2]

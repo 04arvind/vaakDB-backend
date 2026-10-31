@@ -52,7 +52,7 @@ class AISettings(BaseSettings):
     GROQ_BASE_URL: str = "https://api.groq.com/openai/v1"
 
     GEMINI_API_KEY: SecretStr | None = None
-    GEMINI_MODEL: str = "gemini-2.5-flash"
+    GEMINI_MODEL: str = "gemini-3.6-flash"
     GEMINI_EMBED_MODEL: str = "gemini-embedding-001"
     GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta"
     # 0 disables "thinking" on Flash models so it cannot eat the output budget.
