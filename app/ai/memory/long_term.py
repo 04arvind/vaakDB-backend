@@ -1,137 +1,134 @@
-"""Long-term memory: durable facts about a user, stored in ai_memories.
+"""Long-term memories: durable facts and preferences per user.
 
-    items = await MemoryAgent().extract_memories(messages)
-    await save_memories(user_id, items, source_session=session_id)
-    facts = await recall(user_id, query="monthly revenue", limit=5)
+Flow (run it after the reply is sent, e.g. as a FastAPI BackgroundTask):
+    memory_agent.extract_memories(history)  ->  save_memories(user_id, items)
+or simply:
+    await update_long_term_memory(user_id, session_id)
 
-or, in one best-effort call after each exchange:
-    await update_long_term_memory(user_id, session_id, messages)
+At answer time, call recall(user_id, question) and pass the result to
+context_builder as a "What you know about this user" section.
 
-Every query is scoped by user_id. Each user keeps at most MEMORY_MAX_PER_USER
-memories; the least important / oldest are pruned first.
+Recall is by importance, recency and keyword overlap. When you have many memories per
+user, upgrade it to semantic search with db/vector_store.py.
 """
 from __future__ import annotations
 
 import logging
+import os
 import re
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 from sqlalchemy import text
 
 from app.ai.db.engine import cfg, get_write_engine
-from app.ai.schemas.llm_io import Message
+
+if TYPE_CHECKING:  # avoid importing the agents (and providers) at module load
+    from app.ai.agents.memory_agent import MemoryItem
 
 log = logging.getLogger(__name__)
 
-_WORD = re.compile(r"[a-z0-9]{3,}")
-_RECALL_POOL = 100  # candidates scanned for keyword relevance
-
-_UPSERT = text(
-    """INSERT INTO ai_memories (user_id, content, category, importance, source_session)
-       VALUES (:uid, :content, :category, :importance, :sid)
-       ON CONFLICT (user_id, content) DO UPDATE
-         SET importance = GREATEST(ai_memories.importance, EXCLUDED.importance),
-             category   = EXCLUDED.category,
-             updated_at = now()"""
-)
-
-_PRUNE = text(
-    """DELETE FROM ai_memories
-       WHERE user_id = :uid AND id NOT IN (
-         SELECT id FROM ai_memories WHERE user_id = :uid
-         ORDER BY importance DESC, updated_at DESC
-         LIMIT :keep
-       )"""
-)
+# Defence in depth: the memory agent is told not to save secrets, but never trust that alone.
+_SECRET_PATTERNS = [
+    re.compile(r"\b(?:\d[ -]?){13,19}\b"),  # card-like numbers
+    re.compile(r"\b(?:api[_ -]?key|password|passwd|secret|token|cvv|pin|otp)\b\s*(?:is|=|:)", re.I),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"\bgsk_[A-Za-z0-9]{16,}"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{30,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),  # JWT
+]
 
 
-def _normalize(content: str) -> str:
-    return " ".join(content.split()).strip()
+def looks_sensitive(content: str) -> bool:
+    return any(p.search(content) for p in _SECRET_PATTERNS)
 
 
 async def save_memories(
     user_id: str,
-    items: Sequence[Any],
+    items: Sequence["MemoryItem"],
     *,
     source_session: str | None = None,
 ) -> int:
-    """Upsert MemoryItem-like objects (content, category, importance). Returns count saved."""
-    if not user_id:
-        raise ValueError("A user is required.")
-    params = []
-    seen: set[str] = set()
-    for item in items:
-        content = _normalize(getattr(item, "content", "") or "")[:500]
-        if len(content) < 3 or content.lower() in seen:
-            continue
-        seen.add(content.lower())
-        params.append({
-            "uid": user_id,
-            "content": content,
-            "category": getattr(item, "category", "other") or "other",
-            "importance": max(1, min(int(getattr(item, "importance", 3) or 3), 5)),
-            "sid": source_session,
-        })
-    if not params:
+    """Store memories (duplicates just raise importance). Returns how many were accepted."""
+    clean = [i for i in items if not looks_sensitive(i.content)]
+    if len(clean) < len(items):
+        log.info("Skipped %d memories that looked sensitive", len(items) - len(clean))
+    if not clean:
         return 0
 
-    keep = int(cfg("MEMORY_MAX_PER_USER", 200))
+    cap = int(cfg("MAX_MEMORIES_PER_USER", 200))
+    upsert = text(
+        """INSERT INTO ai_memories (user_id, content, category, importance, source_session)
+           VALUES (:uid, :content, :category, :importance, :src)
+           ON CONFLICT (user_id, content) DO UPDATE
+             SET importance = GREATEST(ai_memories.importance, EXCLUDED.importance),
+                 updated_at = now()"""
+    )
+    trim = text(
+        """DELETE FROM ai_memories
+           WHERE user_id = :uid AND id IN (
+             SELECT id FROM ai_memories WHERE user_id = :uid
+             ORDER BY importance DESC, updated_at DESC OFFSET :cap
+           )"""
+    )
+    params = [
+        {
+            "uid": user_id,
+            "content": i.content.strip(),
+            "category": i.category,
+            "importance": i.importance,
+            "src": source_session,
+        }
+        for i in clean
+    ]
     async with get_write_engine().begin() as conn:
-        await conn.execute(_UPSERT, params)
-        await conn.execute(_PRUNE, {"uid": user_id, "keep": keep})
-    log.info("Saved %d memories for user", len(params))
-    return len(params)
+        await conn.execute(upsert, params)
+        await conn.execute(trim, {"uid": user_id, "cap": cap})
+    return len(clean)
 
 
-async def recall(user_id: str, query: str | None = None, *, limit: int = 5) -> list[str]:
-    """Most useful memories for this user, ranked by keyword overlap with `query`,
-    then importance and recency. Returns plain sentences for the prompt."""
-    limit = max(1, min(limit, 50))
+async def recall(
+    user_id: str, query: str | None = None, *, limit: int = 8, pool: int = 40
+) -> list[str]:
+    """Most relevant memories for this user, as plain sentences."""
     async with get_write_engine().connect() as conn:
         rows = (
             await conn.execute(
                 text(
-                    "SELECT content, importance FROM ai_memories WHERE user_id = :uid "
-                    "ORDER BY importance DESC, updated_at DESC LIMIT :n"
+                    """SELECT content, importance FROM ai_memories WHERE user_id = :uid
+                       ORDER BY importance DESC, updated_at DESC LIMIT :pool"""
                 ),
-                {"uid": user_id, "n": _RECALL_POOL},
+                {"uid": user_id, "pool": pool},
             )
         ).all()
-    if not rows:
-        return []
 
-    words = set(_WORD.findall((query or "").lower()))
-    ranked = sorted(
-        enumerate(rows),
-        key=lambda pair: (
-            -len(words & set(_WORD.findall(pair[1].content.lower()))),
-            -pair[1].importance,
-            pair[0],  # recency order from SQL
-        ),
-    )
-    return [r.content for _, r in ranked[:limit]]
+    if not query:
+        return [r.content for r in rows[:limit]]
+
+    words = set(re.findall(r"\w{3,}", query.lower()))
+
+    def score(row) -> int:
+        overlap = len(words & set(re.findall(r"\w{3,}", row.content.lower())))
+        return row.importance + 2 * min(overlap, 3)
+
+    ranked = sorted(rows, key=score, reverse=True)  # stable: ties keep recency order
+    return [r.content for r in ranked[:limit]]
 
 
-async def list_memories(user_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
-    limit = max(1, min(limit, 500))
+async def list_memories(user_id: str) -> list[dict[str, Any]]:
     async with get_write_engine().connect() as conn:
         rows = (
             await conn.execute(
                 text(
-                    "SELECT id, content, category, importance, updated_at FROM ai_memories "
-                    "WHERE user_id = :uid ORDER BY importance DESC, updated_at DESC LIMIT :n"
+                    "SELECT id, content, category, importance FROM ai_memories "
+                    "WHERE user_id = :uid ORDER BY importance DESC, updated_at DESC"
                 ),
-                {"uid": user_id, "n": limit},
+                {"uid": user_id},
             )
         ).all()
     return [
-        {
-            "id": r.id,
-            "content": r.content,
-            "category": r.category,
-            "importance": r.importance,
-            "updated_at": r.updated_at,
-        }
+        {"id": r.id, "content": r.content, "category": r.category, "importance": r.importance}
         for r in rows
     ]
 
@@ -139,13 +136,14 @@ async def list_memories(user_id: str, *, limit: int = 100) -> list[dict[str, Any
 async def delete_memory(user_id: str, memory_id: int) -> bool:
     async with get_write_engine().begin() as conn:
         result = await conn.execute(
-            text("DELETE FROM ai_memories WHERE id = :mid AND user_id = :uid"),
-            {"mid": memory_id, "uid": user_id},
+            text("DELETE FROM ai_memories WHERE id = :id AND user_id = :uid"),
+            {"id": memory_id, "uid": user_id},
         )
     return result.rowcount > 0
 
 
 async def delete_all_memories(user_id: str) -> int:
+    """'Forget everything about me'."""
     async with get_write_engine().begin() as conn:
         result = await conn.execute(
             text("DELETE FROM ai_memories WHERE user_id = :uid"), {"uid": user_id}
@@ -153,19 +151,16 @@ async def delete_all_memories(user_id: str) -> int:
     return result.rowcount
 
 
-async def update_long_term_memory(
-    user_id: str,
-    session_id: str | None,
-    messages: Sequence[Message],
-    *,
-    provider: str | None = None,
-) -> int:
-    """Extract and save memories from recent messages. Best-effort: never raises."""
-    from app.ai.agents.memory_agent import MemoryAgent  # lazy: agents import providers
-
+async def update_long_term_memory(user_id: str, session_id: str, *, window: int = 10) -> int:
+    """Look at the latest messages, let the memory agent pick what to keep, and save it.
+    Best effort: failures are logged and never raised (this runs in the background)."""
     try:
-        items = await MemoryAgent(provider=provider).extract_memories(list(messages))
-        return await save_memories(user_id, items, source_session=session_id) if items else 0
+        from app.ai.agents.memory_agent import MemoryAgent
+        from app.ai.memory.conversation import get_history
+
+        history = await get_history(session_id, user_id, limit=window)
+        items = await MemoryAgent().extract_memories(history)
+        return await save_memories(user_id, items, source_session=session_id)
     except Exception:
         log.exception("Long-term memory update failed")
         return 0
