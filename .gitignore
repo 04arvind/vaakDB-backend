@@ -45,3 +45,36 @@ htmlcov/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Uploaded files (UPLOAD_DIR)
+var/
+
+# Node modules (if any JS tooling is added)
+node_modules/
+
+# Secrets / keys / certificates
+*.pem
+*.key
+*.crt
+*.p12
+secrets/
+credentials*.json
+service-account*.json
+
+# Extra Python tooling caches
+.dmypy.json
+dmypy.json
+.hypothesis/
+.ipynb_checkpoints/
+.cache/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Editor swap / misc
+*.swp
+*.swo
+*~
+desktop.ini
+
+# Claude Code local settings
+.claude/settings.local.json

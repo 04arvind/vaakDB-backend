@@ -15,6 +15,7 @@ services:
 
     volumes:
       - vaakdb_postgres_data:/var/lib/postgresql/data
+      - ./infra/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
 
     healthcheck:
       test:

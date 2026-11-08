@@ -1,0 +1,8 @@
+-r requirements.txt
+-r app/ai/requirements.txt
+testcontainers[postgres]
+pytest
+pytest-asyncio
+ruff
+mypy
+types-PyYAML

@@ -18,3 +18,5 @@ structlog
 langchain
 langgraph
 chromadb
+pdfplumber
+sse-starlette
